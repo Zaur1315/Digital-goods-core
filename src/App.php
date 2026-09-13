@@ -4,207 +4,85 @@ declare(strict_types=1);
 final class App
 {
     private PDO $db;
-
-    public function __construct()
-    {
-        $dsn = getenv('DATABASE_DSN') ?: 'sqlite:' . dirname(__DIR__) . '/var/store.sqlite';
-        if (str_starts_with($dsn, 'sqlite:')) @mkdir(dirname(substr($dsn, 7)), 0775, true);
-        $this->db = new PDO($dsn, getenv('DB_USER') ?: '', getenv('DB_PASSWORD') ?: '', [
-            PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION, PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
-        ]);
-        $this->db->exec('PRAGMA busy_timeout=10000');
-        $this->migrate();
+    public function __construct(?string $dsn=null) {
+        $dsn ??= getenv('DATABASE_DSN') ?: 'sqlite:'.dirname(__DIR__).'/var/store.sqlite';
+        if(str_starts_with($dsn,'sqlite:')) @mkdir(dirname(substr($dsn,7)),0775,true);
+        $this->db=new PDO($dsn,getenv('DB_USER')?:'',getenv('DB_PASSWORD')?:'',[PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION,PDO::ATTR_DEFAULT_FETCH_MODE=>PDO::FETCH_ASSOC]);
+        $this->db->exec('PRAGMA busy_timeout=10000'); $this->db->exec('PRAGMA foreign_keys=ON'); $this->migrate();
     }
-
-    public function handle(): void
-    {
+    public function handle():void {
         header('Content-Type: application/json');
-        try {
-            $method = $_SERVER['REQUEST_METHOD'];
-            $path = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH) ?: '/';
-            $body = json_decode(file_get_contents('php://input'), true) ?: [];
-            if ($method === 'POST' && $path === '/orders') $this->json($this->createOrder($body), 201);
-            elseif ($method === 'POST' && $path === '/webhooks/payment') $this->json($this->payment($body));
-            elseif ($method === 'POST' && $path === '/reconcile') $this->json($this->reconcile());
-            elseif ($method === 'POST' && $path === '/worker') $this->json($this->worker());
-            elseif ($method === 'GET' && $path === '/catalog') $this->json($this->catalog($_GET));
-            elseif ($method === 'GET' && preg_match('#^/orders/([a-f0-9-]+)$#', $path, $m)) $this->json($this->order($m[1]));
-            else $this->json(['error' => 'not_found'], 404);
-        } catch (Throwable $e) {
-            $this->log('error', ['message' => $e->getMessage()]);
-            $this->json(['error' => $e->getMessage()], 400);
-        }
+        try {$m=$_SERVER['REQUEST_METHOD'];$p=parse_url($_SERVER['REQUEST_URI'],PHP_URL_PATH)?:'/';$b=json_decode(file_get_contents('php://input'),true)?:[];
+            if($m==='POST'&&$p==='/orders')$this->json($this->createOrder($b),201);
+            elseif($m==='POST'&&$p==='/webhooks/payment')$this->json($this->payment($b));
+            elseif($m==='POST'&&$p==='/worker')$this->json($this->worker((int)($b['limit']??100)));
+            elseif($m==='POST'&&$p==='/reconcile')$this->json($this->reconcile());
+            elseif($m==='GET'&&$p==='/queue')$this->json($this->queueStats());
+            elseif($m==='GET'&&$p==='/reports/money')$this->json($this->moneyReport($_GET));
+            elseif($m==='GET'&&$p==='/catalog')$this->json($this->catalog($_GET));
+            elseif($m==='GET'&&preg_match('#^/orders/([a-f0-9-]+)/at$#',$p,$x))$this->json($this->orderAt($x[1],(string)($_GET['at']??'')));
+            elseif($m==='GET'&&preg_match('#^/orders/([a-f0-9-]+)$#',$p,$x))$this->json($this->order($x[1])); else $this->json(['error'=>'not_found'],404);
+        } catch(Throwable $e){$this->json(['error'=>$e->getMessage()],$e instanceof InvalidArgumentException?422:500);}
     }
-
-    private function migrate(): void
-    {
-        $this->db->exec('CREATE TABLE IF NOT EXISTS catalog (id INTEGER PRIMARY KEY AUTOINCREMENT, sku TEXT UNIQUE NOT NULL, title TEXT NOT NULL, price_cents INTEGER NOT NULL, stock INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1)');
-        $this->db->exec('CREATE INDEX IF NOT EXISTS catalog_hot ON catalog(active, stock DESC, id)');
-        $this->db->exec('CREATE TABLE IF NOT EXISTS orders (id TEXT PRIMARY KEY, sku TEXT NOT NULL, customer TEXT NOT NULL, amount_cents INTEGER NOT NULL, status TEXT NOT NULL, delivery_code TEXT, delivery_provider TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)');
-        $this->db->exec('CREATE TABLE IF NOT EXISTS payments (payment_id TEXT PRIMARY KEY, order_id TEXT UNIQUE NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL)');
-        $this->db->exec('CREATE TABLE IF NOT EXISTS payment_events (event_id TEXT PRIMARY KEY, payment_id TEXT NOT NULL, order_id TEXT NOT NULL, created_at TEXT NOT NULL)');
-        $this->db->exec('CREATE TABLE IF NOT EXISTS supplier_reservations (provider TEXT NOT NULL, idempotency_key TEXT NOT NULL, code TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(provider,idempotency_key))');
-        $this->db->exec('CREATE TABLE IF NOT EXISTS audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, event TEXT NOT NULL, order_id TEXT, data TEXT NOT NULL, created_at TEXT NOT NULL)');
-        if ((int)$this->db->query('SELECT COUNT(*) FROM catalog')->fetchColumn() === 0) $this->db->exec("INSERT INTO catalog(sku,title,price_cents,stock) VALUES ('GAME-100','Demo Game 100',1999,100),('GAME-200','Demo Game 200',2999,100)");
+    private function migrate():void {
+        foreach([
+            "CREATE TABLE IF NOT EXISTS catalog (id INTEGER PRIMARY KEY AUTOINCREMENT,sku TEXT UNIQUE NOT NULL,title TEXT NOT NULL,price_cents INTEGER NOT NULL,stock INTEGER NOT NULL DEFAULT 0,active INTEGER NOT NULL DEFAULT 1,provider TEXT NOT NULL DEFAULT 'A')",
+            'CREATE TABLE IF NOT EXISTS orders_v2 (id TEXT PRIMARY KEY,customer TEXT NOT NULL,amount_cents INTEGER NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)',
+            'CREATE TABLE IF NOT EXISTS order_items (id TEXT PRIMARY KEY,order_id TEXT NOT NULL REFERENCES orders_v2(id),sku TEXT NOT NULL,provider TEXT NOT NULL,price_cents INTEGER NOT NULL,status TEXT NOT NULL,delivery_code TEXT UNIQUE,failure TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)',
+            'CREATE TABLE IF NOT EXISTS payments_v2 (payment_id TEXT PRIMARY KEY,order_id TEXT UNIQUE NOT NULL,amount_cents INTEGER NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL)',
+            'CREATE TABLE IF NOT EXISTS payment_events_v2 (event_id TEXT PRIMARY KEY,payment_id TEXT NOT NULL,order_id TEXT NOT NULL,created_at TEXT NOT NULL)',
+            'CREATE TABLE IF NOT EXISTS refunds (id TEXT PRIMARY KEY,order_id TEXT NOT NULL,item_id TEXT UNIQUE NOT NULL,amount_cents INTEGER NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL)',
+            'CREATE TABLE IF NOT EXISTS delivery_jobs (item_id TEXT PRIMARY KEY,provider TEXT NOT NULL,priority INTEGER NOT NULL,status TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,available_at TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)',
+            'CREATE INDEX IF NOT EXISTS jobs_ready ON delivery_jobs(status,available_at,priority DESC,created_at)',
+            'CREATE TABLE IF NOT EXISTS supplier_issues (provider TEXT NOT NULL,idempotency_key TEXT NOT NULL,sku TEXT NOT NULL,code TEXT NOT NULL,created_at TEXT NOT NULL,PRIMARY KEY(provider,idempotency_key))',
+            'CREATE TABLE IF NOT EXISTS supplier_codes (code TEXT PRIMARY KEY,provider TEXT NOT NULL,sku TEXT NOT NULL,issued_key TEXT UNIQUE,issued_at TEXT)',
+            'CREATE TABLE IF NOT EXISTS deliveries (item_id TEXT PRIMARY KEY,order_id TEXT NOT NULL,provider TEXT NOT NULL,code TEXT UNIQUE NOT NULL,created_at TEXT NOT NULL)',
+            'CREATE TABLE IF NOT EXISTS rate_usage (provider TEXT NOT NULL,window_start INTEGER NOT NULL,used INTEGER NOT NULL,PRIMARY KEY(provider,window_start))',
+            'CREATE TABLE IF NOT EXISTS domain_events (id INTEGER PRIMARY KEY AUTOINCREMENT,event_id TEXT UNIQUE NOT NULL,aggregate_id TEXT NOT NULL,type TEXT NOT NULL,data TEXT NOT NULL,occurred_at TEXT NOT NULL)',
+            'CREATE INDEX IF NOT EXISTS events_time ON domain_events(aggregate_id,occurred_at,id)'
+        ] as $sql)$this->db->exec($sql);
+        $cols=$this->db->query('PRAGMA table_info(catalog)')->fetchAll(PDO::FETCH_COLUMN,1);if(!in_array('provider',$cols,true))$this->db->exec("ALTER TABLE catalog ADD COLUMN provider TEXT NOT NULL DEFAULT 'A'");
+        if(!(int)$this->db->query('SELECT COUNT(*) FROM catalog')->fetchColumn())$this->db->exec("INSERT INTO catalog(sku,title,price_cents,stock,provider) VALUES('GAME-100','Demo Game 100',1999,100,'A'),('GAME-200','Demo Game 200',2999,100,'B'),('GAME-300','Demo Game 300',999,100,'A')");
+        $this->db->exec("UPDATE catalog SET provider='B' WHERE sku='GAME-200'");$i=$this->db->prepare('INSERT OR IGNORE INTO supplier_codes(code,provider,sku) VALUES(?,?,?)');
+        foreach($this->db->query('SELECT sku,provider FROM catalog') as $p)for($n=1;$n<=250;$n++)$i->execute([sprintf('%s-%s-%04d',$p['provider'],$p['sku'],$n),$p['provider'],$p['sku']]);
     }
-
-    private function createOrder(array $b): array
-    {
-        $sku = trim((string)($b['sku'] ?? ''));
-        $customer = trim((string)($b['customer'] ?? ''));
-        $s = $this->db->prepare('SELECT * FROM catalog WHERE sku=? AND active=1');
-        $s->execute([$sku]);
-        $item = $s->fetch();
-        if (!$item || $customer === '') throw new InvalidArgumentException('invalid sku or customer');
-        $id = $this->uuid();
-        $now = gmdate('c');
-        $q = $this->db->prepare('INSERT INTO orders VALUES(?,?,?,?,?,?,?,?,?)');
-        $q->execute([$id, $sku, $customer, $item['price_cents'], 'pending_payment', null, null, $now, $now]);
-        $this->log('order.created', ['sku' => $sku, 'amount_cents' => $item['price_cents']], $id);
-        return $this->order($id);
+    private function createOrder(array $b):array {
+        $customer=trim((string)($b['customer']??''));$requested=$b['items']??(isset($b['sku'])?[['sku'=>$b['sku']]]:[]);if($customer===''||!is_array($requested)||!$requested)throw new InvalidArgumentException('customer and items are required');$lines=[];
+        foreach($requested as $line){$sku=trim((string)($line['sku']??''));$qty=(int)($line['quantity']??1);if($sku===''||$qty<1||$qty>20)throw new InvalidArgumentException('invalid order item');$q=$this->db->prepare('SELECT sku,price_cents,provider FROM catalog WHERE sku=? AND active=1');$q->execute([$sku]);$p=$q->fetch();if(!$p)throw new InvalidArgumentException("unknown sku: $sku");for($n=0;$n<$qty;$n++)$lines[]=$p;}
+        if(count($lines)>50)throw new InvalidArgumentException('at most 50 items');$id=$this->uuid();$now=gmdate('c');$amount=array_sum(array_column($lines,'price_cents'));
+        $this->tx(function()use($id,$customer,$lines,$amount,$now){$this->db->prepare('INSERT INTO orders_v2 VALUES(?,?,?,?,?,?)')->execute([$id,$customer,$amount,'pending_payment',$now,$now]);$q=$this->db->prepare('INSERT INTO order_items VALUES(?,?,?,?,?,?,?,?,?,?)');$ids=[];foreach($lines as $p){$iid=$this->uuid();$ids[]=$iid;$q->execute([$iid,$id,$p['sku'],$p['provider'],$p['price_cents'],'pending_payment',null,null,$now,$now]);}$this->event('order.created',$id,['amount_cents'=>$amount,'items'=>$ids],$now);});return $this->order($id);
     }
-
-    private function payment(array $b): array
-    {
-        $id = (string)($b['order_id'] ?? '');
-        $payment = (string)($b['payment_id'] ?? '');
-        $status = (string)($b['status'] ?? '');
-        if ($id === '' || $payment === '' || $status !== 'succeeded') throw new InvalidArgumentException('invalid payment webhook');
-        $this->db->exec('BEGIN IMMEDIATE');
-        try {
-            $q = $this->db->prepare('SELECT * FROM orders WHERE id=?');
-            $q->execute([$id]);
-            $o = $q->fetch();
-            if (!$o) throw new InvalidArgumentException('order not found');
-            $event = 'payment:' . $payment;
-            $ins = $this->db->prepare('INSERT OR IGNORE INTO payment_events VALUES(?,?,?,?)');
-            $ins->execute([$event, $payment, $id, gmdate('c')]);
-            $p = $this->db->prepare('INSERT OR IGNORE INTO payments VALUES(?,?,?,?)');
-            $p->execute([$payment, $id, 'succeeded', gmdate('c')]);
-            if ($o['status'] === 'pending_payment') {
-                $u = $this->db->prepare("UPDATE orders SET status='paid',updated_at=? WHERE id=?");
-                $u->execute([gmdate('c'), $id]);
-                $o['status'] = 'paid';
-            }
-            $this->db->exec('COMMIT');
-        } catch (Throwable $e) {
-            $this->db->exec('ROLLBACK');
-            throw $e;
-        }
-        if ($o['status'] !== 'delivered') $this->deliver($id);
-        return $this->order($id);
+    private function payment(array $b):array {
+        $oid=trim((string)($b['order_id']??''));$pid=trim((string)($b['payment_id']??''));if($oid===''||$pid===''||($b['status']??'')!=='succeeded')throw new InvalidArgumentException('invalid payment webhook');
+        $this->tx(function()use($oid,$pid){$q=$this->db->prepare('SELECT * FROM orders_v2 WHERE id=?');$q->execute([$oid]);$o=$q->fetch();if(!$o)throw new InvalidArgumentException('order not found');$q=$this->db->prepare('SELECT order_id FROM payments_v2 WHERE payment_id=?');$q->execute([$pid]);$bound=$q->fetchColumn();if($bound&&$bound!==$oid)throw new InvalidArgumentException('payment_id belongs to another order');$now=gmdate('c');$q=$this->db->prepare('INSERT OR IGNORE INTO payment_events_v2 VALUES(?,?,?,?)');$q->execute(['payment:'.$pid,$pid,$oid,$now]);if(!$q->rowCount())return;$this->db->prepare('INSERT INTO payments_v2 VALUES(?,?,?,?,?)')->execute([$pid,$oid,$o['amount_cents'],'succeeded',$now]);$this->db->prepare("UPDATE orders_v2 SET status='processing',updated_at=? WHERE id=?")->execute([$now,$oid]);$this->db->prepare("UPDATE order_items SET status='queued',updated_at=? WHERE order_id=?")->execute([$now,$oid]);$items=$this->db->prepare('SELECT id,provider FROM order_items WHERE order_id=?');$items->execute([$oid]);$job=$this->db->prepare("INSERT OR IGNORE INTO delivery_jobs VALUES(?,?,100,'queued',0,?,?,?)");foreach($items as $i)$job->execute([$i['id'],$i['provider'],$now,$now,$now]);$this->event('payment.captured',$oid,['payment_id'=>$pid,'amount_cents'=>(int)$o['amount_cents']],$now);});
+        $this->worker(100,$oid);return $this->order($oid);
     }
-
-    private function deliver(string $id): void
-    {
-        $this->db->exec('BEGIN IMMEDIATE');
-        $q = $this->db->prepare('SELECT * FROM orders WHERE id=?');
-        $q->execute([$id]);
-        $o = $q->fetch();
-        if (!$o || $o['status'] === 'delivered' || $o['status'] === 'pending_payment') {
-            $this->db->exec('COMMIT');
-            return;
-        }
-        $u = $this->db->prepare("UPDATE orders SET status='delivering',updated_at=? WHERE id=?");
-        $u->execute([gmdate('c'), $id]);
-        $this->db->exec('COMMIT');
-        $result = null;
-        $last = null;
-        foreach (['A', 'B'] as $provider) {
-            for ($attempt = 1; $attempt <= 2; $attempt++) {
-                try {
-                    $result = $this->supplier($provider, 'delivery:' . $id, $o['sku']);
-                    break 2;
-                } catch (Throwable $e) {
-                    $last = $e;
-                    usleep(50000 * $attempt);
-                }
-            }
-        }
-        if (!$result) {
-            $this->setStatus($id, 'paid');
-            $this->log('delivery.failed', ['error' => $last?->getMessage()], $id);
-            return;
-        }
-        $q = $this->db->prepare("UPDATE orders SET status='delivered',delivery_code=?,delivery_provider=?,updated_at=? WHERE id=? AND status='delivering'");
-        $q->execute([$result['code'], $result['provider'], gmdate('c'), $id]);
-        $this->log('delivery.completed', ['provider' => $result['provider']], $id);
+    private function worker(int $limit=100,?string $oid=null):array {
+        $limit=max(1,min(500,$limit));$done=0;while($done<$limit){$sql="SELECT j.*,i.order_id,i.sku,i.price_cents FROM delivery_jobs j JOIN order_items i ON i.id=j.item_id WHERE j.status='queued' AND j.available_at<=?";$args=[gmdate('c')];if($oid){$sql.=' AND i.order_id=?';$args[]=$oid;}$q=$this->db->prepare($sql.' ORDER BY j.priority DESC,j.created_at LIMIT 1');$q->execute($args);$job=$q->fetch();if(!$job||!$this->takeRate($job['provider']))break;$this->process($job);$done++;}return ['processed'=>$done,'queue'=>$this->queueStats()];
     }
-
-    private function supplier(string $provider, string $key, string $sku): array
-    {
-        $q = $this->db->prepare('SELECT code FROM supplier_reservations WHERE provider=? AND idempotency_key=?');
-        $q->execute([$provider, $key]);
-        if ($code = $q->fetchColumn()) return ['provider' => $provider, 'code' => $code];
-        $mode = getenv('SUPPLIER_' . $provider . '_MODE') ?: (getenv('SUPPLIER_MODE') ?: 'normal');
-        if ($mode === 'fail') throw new RuntimeException("supplier_$provider failed");
-        $code = 'CODE-' . $provider . '-' . strtoupper(substr(hash('sha256', $key), 0, 12));
-        $i = $this->db->prepare('INSERT INTO supplier_reservations VALUES(?,?,?,?)');
-        $i->execute([$provider, $key, $code, gmdate('c')]);
-        if ($mode === 'timeout') {
-            usleep(300000);
-            throw new RuntimeException("supplier_$provider timeout");
-        }
-        return ['provider' => $provider, 'code' => $code];
+    private function process(array $j):void {
+        $q=$this->db->prepare("UPDATE delivery_jobs SET status='processing',attempts=attempts+1,updated_at=? WHERE item_id=? AND status='queued'");$q->execute([gmdate('c'),$j['item_id']]);if(!$q->rowCount())return;$key='delivery:'.$j['item_id'].':'.((int)$j['attempts']+1);$r=null;$error=null;try{$r=$this->supplier($j['provider'],$key,$j['sku']);}catch(Throwable $e){$error=$e->getMessage();$r=$this->fact($j['provider'],$key);}
+        if($r&&$r['sku']===$j['sku']&&$this->accept($j,$r))return;if($r)$error=$r['sku']!==$j['sku']?'wrong sku':'duplicate code';$attempt=(int)$j['attempts']+1;if($attempt<3){$this->db->prepare("UPDATE delivery_jobs SET status='queued',available_at=?,updated_at=? WHERE item_id=?")->execute([gmdate('c',time()+$attempt),gmdate('c'),$j['item_id']]);$this->event('delivery.retry_scheduled',$j['order_id'],['item_id'=>$j['item_id'],'error'=>$error]);return;}$this->fail($j,$error?:'supplier failed');
     }
-
-    private function worker(): array
-    {
-        $n = 0;
-        foreach ($this->db->query("SELECT id FROM orders WHERE status IN ('paid','delivering') ORDER BY updated_at LIMIT 100") as $o) {
-            $this->deliver($o['id']);
-            $n++;
-        }
-        return ['processed' => $n];
+    private function supplier(string $provider,string $key,string $sku):array {
+        if($f=$this->fact($provider,$key))return $f;$mode=getenv('SUPPLIER_'.$provider.'_MODE')?:getenv('SUPPLIER_MODE')?:'normal';if($mode==='fail')throw new RuntimeException("supplier_$provider failed");
+        if($mode==='duplicate'&&str_ends_with($key,':1')){$q=$this->db->prepare('SELECT code,sku FROM supplier_issues WHERE provider=? ORDER BY created_at LIMIT 1');$q->execute([$provider]);if($old=$q->fetch()){$this->db->prepare('INSERT INTO supplier_issues VALUES(?,?,?,?,?)')->execute([$provider,$key,$old['sku'],$old['code'],gmdate('c')]);return ['provider'=>$provider]+$old;}}
+        $wanted=$sku;if($mode==='wrong'){$q=$this->db->prepare('SELECT sku FROM catalog WHERE sku<>? LIMIT 1');$q->execute([$sku]);$wanted=(string)$q->fetchColumn();}$this->db->exec('BEGIN IMMEDIATE');try{$q=$this->db->prepare('SELECT code FROM supplier_codes WHERE provider=? AND sku=? AND issued_key IS NULL ORDER BY code LIMIT 1');$q->execute([$provider,$wanted]);$code=$q->fetchColumn();if(!$code)throw new RuntimeException('supplier out of stock');$now=gmdate('c');$this->db->prepare('UPDATE supplier_codes SET issued_key=?,issued_at=? WHERE code=? AND issued_key IS NULL')->execute([$key,$now,$code]);$this->db->prepare('INSERT INTO supplier_issues VALUES(?,?,?,?,?)')->execute([$provider,$key,$wanted,$code,$now]);$this->db->exec('COMMIT');}catch(Throwable $e){$this->db->exec('ROLLBACK');throw $e;}if($mode==='timeout')throw new RuntimeException('supplier timeout after issue');return ['provider'=>$provider,'code'=>$code,'sku'=>$wanted];
     }
-
-    private function reconcile(): array
-    {
-        $a = $this->db->query("SELECT id FROM orders WHERE status IN ('paid','delivering')")->fetchAll(PDO::FETCH_COLUMN);
-        $b = $this->db->query("SELECT id FROM orders WHERE status='delivered' AND id NOT IN (SELECT order_id FROM payments WHERE status='succeeded')")->fetchAll(PDO::FETCH_COLUMN);
-        return ['paid_not_delivered' => $a, 'delivered_not_paid' => $b];
-    }
-
-    private function catalog(array $p): array
-    {
-        $limit = min(100, max(1, (int)($p['limit'] ?? 50)));
-        $offset = max(0, (int)($p['offset'] ?? 0));
-        $q = $this->db->prepare('SELECT sku,title,price_cents,stock FROM catalog WHERE active=1 ORDER BY stock DESC,id LIMIT ? OFFSET ?');
-        $q->bindValue(1, $limit, PDO::PARAM_INT);
-        $q->bindValue(2, $offset, PDO::PARAM_INT);
-        $q->execute();
-        return ['items' => $q->fetchAll()];
-    }
-
-    private function order(string $id): array
-    {
-        $q = $this->db->prepare('SELECT * FROM orders WHERE id=?');
-        $q->execute([$id]);
-        $o = $q->fetch();
-        if (!$o) throw new InvalidArgumentException('order not found');
-        return $o;
-    }
-
-    private function setStatus(string $id, string $s): void
-    {
-        $q = $this->db->prepare('UPDATE orders SET status=?,updated_at=? WHERE id=?');
-        $q->execute([$s, gmdate('c'), $id]);
-    }
-
-    private function log(string $event, array $data = [], ?string $id = null): void
-    {
-        $q = $this->db->prepare('INSERT INTO audit_log(event,order_id,data,created_at) VALUES(?,?,?,?)');
-        $q->execute([$event, $id, json_encode($data, JSON_UNESCAPED_UNICODE), gmdate('c')]);
-    }
-
-    private function json(mixed $v, int $code = 200): void
-    {
-        http_response_code($code);
-        echo json_encode($v, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
-    }
-
-    private function uuid(): string
-    {
-        return sprintf('%s-%s-%s-%s-%s', bin2hex(random_bytes(4)), bin2hex(random_bytes(2)), bin2hex(random_bytes(2)), bin2hex(random_bytes(2)), bin2hex(random_bytes(6)));
-    }
+    private function fact(string $provider,string $key):?array {$q=$this->db->prepare('SELECT provider,code,sku FROM supplier_issues WHERE provider=? AND idempotency_key=?');$q->execute([$provider,$key]);return $q->fetch()?:null;}
+    private function accept(array $j,array $r):bool {try{$this->tx(function()use($j,$r){$now=gmdate('c');$this->db->prepare('INSERT INTO deliveries VALUES(?,?,?,?,?)')->execute([$j['item_id'],$j['order_id'],$r['provider'],$r['code'],$now]);$this->db->prepare("UPDATE order_items SET status='delivered',delivery_code=?,failure=NULL,updated_at=? WHERE id=?")->execute([$r['code'],$now,$j['item_id']]);$this->db->prepare("UPDATE delivery_jobs SET status='done',updated_at=? WHERE item_id=?")->execute([$now,$j['item_id']]);$this->event('item.delivered',$j['order_id'],['item_id'=>$j['item_id'],'amount_cents'=>(int)$j['price_cents'],'code'=>$r['code']],$now);$this->refresh($j['order_id'],$now);});return true;}catch(PDOException){return false;}}
+    private function fail(array $j,string $error):void {$this->tx(function()use($j,$error){$now=gmdate('c');$this->db->prepare("UPDATE order_items SET status='refunded',failure=?,updated_at=? WHERE id=? AND status<>'delivered'")->execute([$error,$now,$j['item_id']]);$this->db->prepare("UPDATE delivery_jobs SET status='failed',updated_at=? WHERE item_id=?")->execute([$now,$j['item_id']]);$this->db->prepare('INSERT OR IGNORE INTO refunds VALUES(?,?,?,?,?,?)')->execute(['refund:'.$j['item_id'],$j['order_id'],$j['item_id'],$j['price_cents'],'succeeded',$now]);$this->event('item.refunded',$j['order_id'],['item_id'=>$j['item_id'],'amount_cents'=>(int)$j['price_cents'],'reason'=>$error],$now);$this->refresh($j['order_id'],$now);});}
+    private function refresh(string $oid,string $now):void {$q=$this->db->prepare("SELECT COUNT(*) total,SUM(status='delivered') delivered,SUM(status='refunded') refunded FROM order_items WHERE order_id=?");$q->execute([$oid]);$c=$q->fetch();if((int)$c['delivered']+(int)$c['refunded']<(int)$c['total'])return;$status=(int)$c['delivered']===(int)$c['total']?'fulfilled':((int)$c['refunded']===(int)$c['total']?'refunded':'partially_fulfilled');$this->db->prepare('UPDATE orders_v2 SET status=?,updated_at=? WHERE id=?')->execute([$status,$now,$oid]);$this->event('order.completed',$oid,['status'=>$status],$now);}
+    private function reconcile():array {$recovered=[];$invalid=[];$q=$this->db->query("SELECT j.*,i.order_id,i.sku,i.price_cents FROM delivery_jobs j JOIN order_items i ON i.id=j.item_id WHERE j.status IN('processing','queued')");foreach($q as $j){$key='delivery:'.$j['item_id'].':'.max(1,(int)$j['attempts']);$f=$this->fact($j['provider'],$key);if($f&&$f['sku']===$j['sku']&&$this->accept($j,$f))$recovered[]=$j['item_id'];elseif($f)$invalid[]=$j['item_id'];elseif($j['status']==='processing')$this->db->prepare("UPDATE delivery_jobs SET status='queued',available_at=?,updated_at=? WHERE item_id=?")->execute([gmdate('c'),gmdate('c'),$j['item_id']]);}$this->worker();return ['recovered'=>$recovered,'invalid_supplier_responses'=>$invalid,'money'=>$this->moneyReport([]),'queue'=>$this->queueStats()];}
+    private function takeRate(string $provider):bool {$limit=max(1,(int)(getenv('SUPPLIER_'.$provider.'_RPM')?:getenv('SUPPLIER_RPM')?:60));$window=intdiv(time(),60)*60;return $this->tx(function()use($provider,$limit,$window){$this->db->prepare('INSERT OR IGNORE INTO rate_usage VALUES(?,?,0)')->execute([$provider,$window]);$q=$this->db->prepare('UPDATE rate_usage SET used=used+1 WHERE provider=? AND window_start=? AND used<?');$q->execute([$provider,$window,$limit]);return $q->rowCount()===1;});}
+    private function queueStats():array {$s=['queued'=>0,'processing'=>0,'done'=>0,'failed'=>0];foreach($this->db->query('SELECT status,COUNT(*) count FROM delivery_jobs GROUP BY status') as $r)$s[$r['status']]=(int)$r['count'];$s['delivered']=(int)$this->db->query('SELECT COUNT(*) FROM deliveries')->fetchColumn();return $s;}
+    private function order(string $id):array {$q=$this->db->prepare('SELECT * FROM orders_v2 WHERE id=?');$q->execute([$id]);$o=$q->fetch();if(!$o)throw new InvalidArgumentException('order not found');$q=$this->db->prepare('SELECT id,sku,provider,price_cents,status,delivery_code,failure FROM order_items WHERE order_id=? ORDER BY created_at,id');$q->execute([$id]);$o['amount_cents']=(int)$o['amount_cents'];$o['items']=$q->fetchAll();$o['money']=$this->orderMoney($id);return $o;}
+    private function orderMoney(string $id):array {$q=$this->db->prepare("SELECT COALESCE((SELECT SUM(amount_cents) FROM payments_v2 WHERE order_id=? AND status='succeeded'),0) paid,COALESCE((SELECT SUM(price_cents) FROM order_items WHERE order_id=? AND status='delivered'),0) delivered,COALESCE((SELECT SUM(amount_cents) FROM refunds WHERE order_id=? AND status='succeeded'),0) refunded");$q->execute([$id,$id,$id]);$m=array_map('intval',$q->fetch());$m['balanced']=$m['paid']===$m['delivered']+$m['refunded'];return $m;}
+    private function orderAt(string $id,string $at):array {if($at===''||strtotime($at)===false)throw new InvalidArgumentException('valid ISO-8601 at is required');$q=$this->db->prepare('SELECT type,data FROM domain_events WHERE aggregate_id=? AND occurred_at<=? ORDER BY occurred_at,id');$q->execute([$id,gmdate('c',strtotime($at))]);$s=['order_id'=>$id,'at'=>$at,'status'=>null,'paid_cents'=>0,'delivered_cents'=>0,'refunded_cents'=>0,'items'=>[],'events'=>0];foreach($q as $e){$d=json_decode($e['data'],true);$s['events']++;if($e['type']==='order.created')$s['status']='pending_payment';elseif($e['type']==='payment.captured'){$s['paid_cents']+=(int)$d['amount_cents'];$s['status']='processing';}elseif($e['type']==='item.delivered'){$s['delivered_cents']+=(int)$d['amount_cents'];$s['items'][$d['item_id']]='delivered';}elseif($e['type']==='item.refunded'){$s['refunded_cents']+=(int)$d['amount_cents'];$s['items'][$d['item_id']]='refunded';}elseif($e['type']==='order.completed')$s['status']=$d['status'];}if(!$s['events'])throw new InvalidArgumentException('order did not exist at this time');$s['balanced']=$s['paid_cents']===$s['delivered_cents']+$s['refunded_cents'];return $s;}
+    private function moneyReport(array $p):array {$from=isset($p['from'])?gmdate('c',strtotime((string)$p['from'])):'0000-01-01T00:00:00+00:00';$to=isset($p['to'])?gmdate('c',strtotime((string)$p['to'])):'9999-12-31T23:59:59+00:00';$q=$this->db->prepare("SELECT type,data FROM domain_events WHERE occurred_at BETWEEN ? AND ? AND type IN('payment.captured','item.delivered','item.refunded') ORDER BY id");$q->execute([$from,$to]);$m=['paid_cents'=>0,'delivered_cents'=>0,'refunded_cents'=>0];foreach($q as $e){$d=json_decode($e['data'],true);$k=$e['type']==='payment.captured'?'paid_cents':($e['type']==='item.delivered'?'delivered_cents':'refunded_cents');$m[$k]+=(int)$d['amount_cents'];}$m['balanced']=$m['paid_cents']===$m['delivered_cents']+$m['refunded_cents'];return $m;}
+    private function catalog(array $p):array {$l=min(100,max(1,(int)($p['limit']??50)));$o=max(0,(int)($p['offset']??0));$q=$this->db->prepare('SELECT sku,title,price_cents,stock,provider FROM catalog WHERE active=1 ORDER BY stock DESC,id LIMIT ? OFFSET ?');$q->bindValue(1,$l,PDO::PARAM_INT);$q->bindValue(2,$o,PDO::PARAM_INT);$q->execute();return ['items'=>$q->fetchAll()];}
+    private function event(string $type,string $id,array $data,string $at=''):void {$this->db->prepare('INSERT INTO domain_events(event_id,aggregate_id,type,data,occurred_at) VALUES(?,?,?,?,?)')->execute([$this->uuid(),$id,$type,json_encode($data,JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES),$at?:gmdate('c')]);}
+    private function tx(callable $fn):mixed {$this->db->exec('BEGIN IMMEDIATE');try{$r=$fn();$this->db->exec('COMMIT');return $r;}catch(Throwable $e){$this->db->exec('ROLLBACK');throw $e;}}
+    private function json(mixed $v,int $code=200):void {http_response_code($code);echo json_encode($v,JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES);}
+    private function uuid():string {return sprintf('%s-%s-%s-%s-%s',bin2hex(random_bytes(4)),bin2hex(random_bytes(2)),bin2hex(random_bytes(2)),bin2hex(random_bytes(2)),bin2hex(random_bytes(6)));}
 }
